@@ -7,6 +7,11 @@
 #
 # Usage: ./scripts/lint-agents.sh [file ...]
 #   If no files given, scans all agent directories.
+#
+# Implementation note: this used to shell out ~10 times per file (grep/head/
+# awk/wc/tr) and crawled on Windows Git Bash, where every fork costs ~50ms
+# across 273 files. It now reads each file once and parses with bash builtins
+# only. Output messages are byte-identical to the forked version.
 
 set -euo pipefail
 
@@ -38,6 +43,8 @@ RECOMMENDED_SECTIONS=("Identity" "Core Mission" "Critical Rules")
 errors=0
 warnings=0
 
+# Sets HEADER_TARGET to "soul" or "agents" (no printf subshell: called once
+# per ## header, and a fork per header re-introduced the Windows crawl).
 classify_header_target() {
   local header_lower="$1"
 
@@ -47,9 +54,9 @@ classify_header_target() {
      [[ "$header_lower" =~ style ]] ||
      [[ "$header_lower" =~ critical.rule ]] ||
      [[ "$header_lower" =~ rules.you.must.follow ]]; then
-    printf 'soul'
+    HEADER_TARGET='soul'
   else
-    printf 'agents'
+    HEADER_TARGET='agents'
   fi
 }
 
@@ -62,27 +69,37 @@ lint_file() {
     return
   fi
 
+  # Single builtin read of the whole file; trailing newlines are dropped,
+  # which none of the checks below depend on.
+  local content
+  content="$(<"$file")"
+
   # 0. Reject CRLF line endings (repo standard is LF — see .gitattributes).
   # A trailing \r otherwise makes the frontmatter check below fail with a
   # confusing "missing frontmatter ---" even when the file clearly starts ---.
-  if LC_ALL=C grep -q $'\r' "$file"; then
+  if [[ "$content" == *$'\r'* ]]; then
     echo "ERROR $file: CRLF line endings detected — convert to LF (e.g. 'perl -i -pe \"s/\\r\$//\" $file'); repo uses LF per .gitattributes"
     errors=$((errors + 1))
     return
   fi
 
   # 1. Check frontmatter delimiters
-  local first_line
-  first_line=$(head -1 "$file")
+  local first_line="${content%%$'\n'*}"
   if [[ "$first_line" != "---" ]]; then
     echo "ERROR $file: missing frontmatter opening ---"
     errors=$((errors + 1))
     return
   fi
 
-  # Extract frontmatter (between first and second ---)
-  local frontmatter
-  frontmatter=$(awk 'NR==1{next} /^---$/{exit} {print}' "$file")
+  # Extract frontmatter (between first and second ---) and the body after it.
+  local rest="${content#*$'\n'}"
+  local frontmatter="" body=""
+  if [[ "$rest" == *$'\n---\n'* ]]; then
+    frontmatter="${rest%%$'\n---\n'*}"
+    body="${rest#*$'\n---\n'}"
+  elif [[ "$rest" == *$'\n---' ]]; then
+    frontmatter="${rest%$'\n---'}"
+  fi
 
   if [[ -z "$frontmatter" ]]; then
     echo "ERROR $file: empty or malformed frontmatter"
@@ -90,32 +107,30 @@ lint_file() {
     return
   fi
 
-  # 2. Check required frontmatter fields
+  # 2. Check required frontmatter fields (at a line start of the frontmatter)
+  local field
   for field in "${REQUIRED_FRONTMATTER[@]}"; do
-    if ! grep -qE -- "^${field}:" <<<"$frontmatter"; then
+    if [[ "$frontmatter" != "$field:"* && "$frontmatter" != *$'\n'"$field:"* ]]; then
       echo "ERROR $file: missing frontmatter field '${field}'"
       errors=$((errors + 1))
     fi
   done
 
   # 3. Check recommended sections (warn only)
-  local body
-  body=$(awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$file")
-
-  # Feed grep from a herestring, not a pipe: `grep -q` exits at the first match
-  # without draining its input, which kills a piping `echo` with SIGPIPE. Under
-  # `set -o pipefail` that 141 becomes the pipeline's status and is indistinguishable
-  # from "no match", so a large body raced its way to a spurious WARN.
+  local section lower_body="${body,,}" lower_section
   for section in "${RECOMMENDED_SECTIONS[@]}"; do
-    if ! grep -qi -- "$section" <<<"$body"; then
+    lower_section="${section,,}"
+    if [[ "$lower_body" != *"$lower_section"* ]]; then
       echo "WARN  $file: missing recommended section '${section}'"
       warnings=$((warnings + 1))
     fi
   done
 
-  # 4. Check file has meaningful content (awk strips wc's leading whitespace on macOS/BSD)
-  local word_count
-  word_count=$(echo "$body" | wc -w | awk '{print $1}')
+  # 4. Check file has meaningful content (unquoted split = wc -w semantics)
+  local word_count=0 w
+  for w in $body; do
+    word_count=$((word_count + 1))
+  done
   if [[ "${word_count:-0}" -lt 50 ]]; then
     echo "WARN  $file: body seems very short (< 50 words)"
     warnings=$((warnings + 1))
@@ -124,12 +139,9 @@ lint_file() {
   local soul_headers=0
   local agents_headers=0
   while IFS= read -r line; do
-    if [[ "$line" =~ ^##[[:space:]] ]]; then
-      local header_lower
-      header_lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
-      local target
-      target=$(classify_header_target "$header_lower")
-      if [[ "$target" == "soul" ]]; then
+    if [[ "$line" == '## '* || "$line" == $'##\t'* ]]; then
+      classify_header_target "${line,,}"
+      if [[ "$HEADER_TARGET" == "soul" ]]; then
         soul_headers=$((soul_headers + 1))
       else
         agents_headers=$((agents_headers + 1))
