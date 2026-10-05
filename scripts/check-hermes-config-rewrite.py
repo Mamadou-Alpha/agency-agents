@@ -24,7 +24,7 @@ PLUGIN = "agency-agents-router"
 
 
 def extract_heredoc(path: Path) -> str:
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     # The heredoc body sits between <<'PY' and the next "PY" sentinel on
     # its own line. The sentinel is exactly "PY" at column 0.
     pattern = re.compile(
@@ -42,18 +42,18 @@ def run_heredoc(heredoc: str, cfg_text: str):
     import yaml
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "config.yaml"
-        p.write_text(cfg_text)
+        p.write_text(cfg_text, encoding="utf-8")
         result = subprocess.run(
             ["python3", "-", str(p), PLUGIN],
             input=heredoc,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=10,
         )
         if result.returncode != 0:
             return None, f"exit={result.returncode} stderr={result.stderr[:200]}"
         try:
-            parsed = yaml.safe_load(p.read_text())
+            parsed = yaml.safe_load(p.read_text(encoding="utf-8"))
             return parsed, None
         except yaml.YAMLError as e:
             return None, f"yaml parse: {e}"
@@ -176,7 +176,7 @@ def main() -> int:
 
     if HERMES_BACKUP.exists():
         configs.append(
-            ("Hermes actual config backup (ground truth)", HERMES_BACKUP.read_text())
+            ("Hermes actual config backup (ground truth)", HERMES_BACKUP.read_text(encoding="utf-8"))
         )
 
     total = 0
